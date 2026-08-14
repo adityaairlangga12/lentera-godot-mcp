@@ -1,0 +1,26 @@
+{
+  "name": "lentera-godot-mcp",
+  "version": "1.0.0",
+  "description": "Custom Godot MCP Server for Lentera Pudar — Real-time WebSocket control + Screenshot verification",
+  "type": "module",
+  "bin": {
+    "lentera-godot-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "dev": "node --watch build/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
