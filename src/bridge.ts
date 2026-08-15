@@ -1,4 +1,4 @@
-﻿// Bridge: WebSocket SERVER + Headless CLI Fallback for Godot 4.7
+// Bridge: WebSocket SERVER + Headless CLI Fallback for Godot 4.7
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -144,8 +144,19 @@ func _init() -> void:
 			while fn != "":
 				if not fn.begins_with("."):
 					files.append(fn)
-				fn = dir.get_next()
-		res["result"] = {"dir": dir_path, "files": files}
+	elif cmd == "run_gdscript":
+		var code = params.get("code", "")
+		var s = GDScript.new()
+		s.source_code = "@tool\nextends RefCounted\nfunc execute():\n" + code
+		var err_c = s.reload()
+		if err_c == OK:
+			var inst = s.new()
+			if inst.has_method("execute"):
+				res["result"] = {"status": "executed", "output": str(inst.execute())}
+			else:
+				res["result"] = {"status": "executed"}
+		else:
+			res["error"] = "Compilation error: " + str(err_c)
 	else:
 		res["result"] = {"status": "ok", "mode": "headless", "command": cmd}
 		
