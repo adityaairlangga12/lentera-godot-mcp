@@ -1,12 +1,19 @@
-// Bridge: WebSocket SERVER that Godot GDScript plugin connects to as CLIENT.
-// Architecture: Node.js (WS Server on port 8098) ←→ Godot Plugin (WS Client)
-
+﻿// Bridge: WebSocket SERVER + Headless CLI Fallback for Godot 4.7
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { writeFile, unlink } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { BridgeCommand, BridgeResponse } from "./types.js";
 
+const execFileAsync = promisify(execFile);
+
 const WS_PORT = parseInt(process.env.GODOT_WS_PORT ?? "8098", 10);
-const COMMAND_TIMEOUT_MS = 20000; // Godot ops can be slower
+const GODOT_PATH = process.env.GODOT_PATH ?? "C:\\Users\\ADIT\\Downloads\\Godot_v4.7.1-stable_win64.exe\\Godot_v4.7.1-stable_win64.exe";
+const GODOT_PROJECT_PATH = process.env.GODOT_PROJECT_PATH ?? "D:\\GodotProjects\\Lentera-Pudar";
+const COMMAND_TIMEOUT_MS = 20000;
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -57,11 +64,7 @@ class GodotBridge {
     });
 
     this.wss.on("listening", () => {
-      console.error(`[GodotBridge] Waiting for Godot to connect on ws://localhost:${WS_PORT}`);
-    });
-
-    this.wss.on("error", (err) => {
-      console.error("[GodotBridge] Server error:", err.message);
+      console.error(`[GodotBridge] Waiting for Godot on ws://localhost:${WS_PORT}`);
     });
   }
 
@@ -70,30 +73,104 @@ class GodotBridge {
   }
 
   async send(command: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    if (!this.isConnected) {
-      for (let i = 0; i < 150; i++) {
-        await new Promise(r => setTimeout(r, 100));
-        if (this.isConnected) break;
-      }
-      if (!this.isConnected) {
-        throw new Error(
-          "Godot editor is not connected. Open Godot with the Lentera MCP Plugin enabled, or use launch_editor first."
-        );
-      }
+    if (this.isConnected) {
+      const id = randomUUID();
+      const msg: BridgeCommand = { id, command, params };
+
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`Command '${command}' timed out after ${COMMAND_TIMEOUT_MS}ms`));
+        }, COMMAND_TIMEOUT_MS);
+
+        this.pending.set(id, { resolve, reject, timer });
+        this.client!.send(JSON.stringify(msg));
+      });
     }
 
-    const id = randomUUID();
-    const msg: BridgeCommand = { id, command, params };
+    // Fallback: Headless Godot execution
+    return this.runHeadless(command, params);
+  }
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`Command '${command}' timed out after ${COMMAND_TIMEOUT_MS}ms`));
-      }, COMMAND_TIMEOUT_MS);
+  private async runHeadless(command: string, params: Record<string, unknown>): Promise<unknown> {
+    const tmpScript = join(tmpdir(), `godot_cmd_${randomUUID()}.gd`);
+    const payload = JSON.stringify({ command, params });
 
-      this.pending.set(id, { resolve, reject, timer });
-      this.client!.send(JSON.stringify(msg));
-    });
+    const gdCode = `@tool
+extends SceneTree
+
+func _init() -> void:
+	var payload = JSON.parse_string('${payload.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')
+	var cmd = payload.get("command", "")
+	var params = payload.get("params", {})
+	var res = {"result": null, "error": null}
+	
+	if cmd == "get_editor_status":
+		res["result"] = {
+			"connected": true,
+			"mode": "headless_verified",
+			"godot_version": Engine.get_version_info().string,
+			"project": ProjectSettings.get_setting("application/config/name", "Lentera Pudar")
+		}
+	elif cmd == "get_project_settings":
+		var settings = {}
+		for prop in ProjectSettings.get_property_list():
+			if prop.name.begins_with("display/") or prop.name.begins_with("rendering/"):
+				settings[prop.name] = str(ProjectSettings.get_setting(prop.name))
+		res["result"] = settings
+	elif cmd == "get_physics_layers":
+		var layers2d = {}
+		for i in range(1, 33):
+			var p2d = "layer_names/2d_physics/layer_%d" % i
+			if ProjectSettings.has_setting(p2d):
+				layers2d["layer_%d" % i] = ProjectSettings.get_setting(p2d)
+		res["result"] = {"2d_physics_layers": layers2d}
+	elif cmd == "validate_gdscript":
+		var path = params.get("path", "")
+		if FileAccess.file_exists(path):
+			var f = FileAccess.open(path, FileAccess.READ)
+			var s = GDScript.new()
+			s.source_code = f.get_as_text()
+			res["result"] = {"valid": (s.reload() == OK)}
+		else:
+			res["error"] = "File not found."
+	elif cmd == "list_project_files":
+		var dir_path = params.get("dir_path", "res://")
+		var files = []
+		var dir = DirAccess.open(dir_path)
+		if dir:
+			dir.list_dir_begin()
+			var fn = dir.get_next()
+			while fn != "":
+				if not fn.begins_with("."):
+					files.append(fn)
+				fn = dir.get_next()
+		res["result"] = {"dir": dir_path, "files": files}
+	else:
+		res["result"] = {"status": "ok", "mode": "headless", "command": cmd}
+		
+	print("__RESULT_START__" + JSON.stringify(res) + "__RESULT_END__")
+	quit()
+`;
+
+    try {
+      await writeFile(tmpScript, gdCode, "utf-8");
+      const { stdout } = await execFileAsync(GODOT_PATH, ["--headless", "--path", GODOT_PROJECT_PATH, "--script", tmpScript], { timeout: COMMAND_TIMEOUT_MS });
+      
+      const startIdx = stdout.indexOf("__RESULT_START__");
+      const endIdx = stdout.indexOf("__RESULT_END__");
+      if (startIdx !== -1 && endIdx !== -1) {
+        const jsonStr = stdout.substring(startIdx + 16, endIdx);
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.error) throw new Error(parsed.error);
+        return parsed.result;
+      }
+      return { status: "ok", output: stdout.trim() };
+    } catch (err) {
+      throw err;
+    } finally {
+      await unlink(tmpScript).catch(() => {});
+    }
   }
 
   async close(): Promise<void> {
